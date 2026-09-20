@@ -8,7 +8,8 @@
 # ]
 # ///
 """
-video_to_context.py — turn a screen recording into context for a Claude Code session.
+video_to_context.py — turn a screen recording into context for an AI coding agent
+(or a human): keyframes, contact sheets, a timestamped transcript and context.md.
 
 What it produces (in the output directory):
   context.md        timeline: every transcript line grouped under the frame that was
@@ -45,7 +46,8 @@ import time
 import unicodedata
 from pathlib import Path
 
-VIDEO_EXTS = {".mov", ".mp4", ".mkv", ".webm", ".m4v", ".avi"}
+# Only used by --latest to find recordings; an explicit path can be any format ffmpeg reads.
+VIDEO_EXTS = {".mov", ".mp4", ".mkv", ".webm", ".m4v", ".avi", ".gif", ".flv", ".wmv", ".ts", ".3gp"}
 
 
 def log(msg: str) -> None:
@@ -179,6 +181,51 @@ def find_latest_recording() -> Path:
     return newest.resolve()
 
 
+# -------------------------------------------------------------------- wall clock
+
+def recording_start(video: Path, info: dict):
+    """
+    When did the recording start? Lets a moment in the video be matched against
+    server/app logs. Returns (datetime, source) or (None, None).
+    Filenames written by the recorders are the start time in local time and are the
+    most trustworthy; container metadata is UTC but some tools stamp it at the end.
+    """
+    from datetime import datetime, timezone
+    name = _norm_name(video.name)
+    pats = [
+        # macOS: "screen recording 2026-09-19 at 3.14.07 pm.mov"
+        (r"(\d{4}-\d{2}-\d{2}) at (\d{1,2})\.(\d{2})\.(\d{2}) ?([ap]m)?", "mac"),
+        # Windows Snipping Tool: "screen recording 2026-09-19 151407.mp4"
+        (r"(\d{4}-\d{2}-\d{2}) (\d{2})(\d{2})(\d{2})\b", "win"),
+        # Xbox Game Bar: "app 2026-09-19 15-14-07.mp4"
+        (r"(\d{4}-\d{2}-\d{2}) (\d{2})-(\d{2})-(\d{2})", "win"),
+    ]
+    for pat, _ in pats:
+        m = re.search(pat, name)
+        if m:
+            h = int(m.group(2))
+            ampm = m.group(5) if m.lastindex and m.lastindex >= 5 else None
+            if ampm == "pm" and h < 12:
+                h += 12
+            if ampm == "am" and h == 12:
+                h = 0
+            try:
+                dt = datetime.strptime(f"{m.group(1)} {h:02d}:{m.group(3)}:{m.group(4)}", "%Y-%m-%d %H:%M:%S")
+                return dt.astimezone(), "filename (local time, recording start)"
+            except ValueError:
+                pass
+    ct = info.get("creation_time")
+    if ct:
+        try:
+            dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(), "file metadata (may mark the start or the end — verify against an on-screen clock)"
+        except ValueError:
+            pass
+    return None, None
+
+
 # ------------------------------------------------------------------------ ffmpeg
 
 FFMPEG = "ffmpeg"
@@ -211,44 +258,322 @@ def probe(video: Path) -> dict:
     dm = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", err)
     dur = int(dm.group(1)) * 3600 + int(dm.group(2)) * 60 + float(dm.group(3)) if dm else 0.0
     ct = re.search(r"creation_time\s*:\s*(\S+)", err)
+    w = int(res.group(1)) if res else None
+    h = int(res.group(2)) if res else None
+    # Phone recordings often store landscape pixels plus a rotation flag; ffmpeg
+    # applies the rotation when decoding, so report the dimensions as displayed.
+    rot = re.search(r"rotation of (-?[\d.]+) degrees", err) or re.search(r"rotate\s*:\s*(-?\d+)", err)
+    rotation = int(round(float(rot.group(1)))) % 360 if rot else 0
+    if rotation in (90, 270) and w and h:
+        w, h = h, w
+    if not dur:
+        # Browser/MediaRecorder WebM files often have no duration in the header:
+        # measure it by reading the stream without decoding.
+        r2 = subprocess.run([FFMPEG, "-hide_banner", "-i", str(video), "-map", "0:v:0", "-c", "copy",
+                             "-f", "null", "-"], capture_output=True, text=True)
+        times = re.findall(r"time=(\d+):(\d+):([\d.]+)", r2.stderr)
+        if times:
+            hh, mm, ss = times[-1]
+            dur = int(hh) * 3600 + int(mm) * 60 + float(ss)
     return {
         "duration": dur,
-        "width": int(res.group(1)) if res else None,
-        "height": int(res.group(2)) if res else None,
+        "rotation": rotation,
+        "width": w,
+        "height": h,
         "has_audio": bool(re.search(r"Stream #.*: Audio:", err)),
         "creation_time": ct.group(1) if ct else None,
     }
 
 
 def auto_sample_fps(duration: float) -> float:
-    if duration <= 180:
-        return 2.0
-    if duration <= 900:
-        return 1.0
-    return 0.5
+    # Analysis runs on small raw frames, so a high rate is cheap; it's what catches
+    # a toast or an error flash that is on screen for less than a second.
+    if duration <= 300:
+        return 12.0
+    if duration <= 1200:
+        return 6.0
+    return 3.0
 
 
 def window_args(start: float, end: float | None) -> list[str]:
     a = ["-ss", f"{start:.3f}"] if start else []
     if end:
-        a += ["-to", f"{end:.3f}"]
+        a += ["-to", f"{end:.3f}"]  # as an input option, -to is a position in the source
     return a
 
 
-def extract_samples(video: Path, fps: float, width: int, dest: Path,
-                    start: float = 0.0, end: float | None = None) -> list[tuple[float, Path]]:
+# ----------------------------------------------------------------- frame choice
+
+PIXEL_TOL = 22   # per-channel difference that counts as a changed pixel
+CELL = 4         # analysis pixels per cell for locating the changed region
+
+
+def _change(a, b):
+    """
+    Return (fraction of pixels changed, binary mask). Uses the largest of the
+    R/G/B differences, not brightness: a field turning red or a green toast on a grey
+    panel barely changes luma and is exactly what a bug recording is about.
+    """
+    from PIL import ImageChops
+    r, g, bl = ImageChops.difference(a, b).split()
+    m = ImageChops.lighter(ImageChops.lighter(r, g), bl).point(lambda v: 255 if v > PIXEL_TOL else 0)
+    return m.histogram()[255] / float(a.size[0] * a.size[1]), m
+
+
+def _bbox(mask, max_regions: int = 3):
+    """
+    Changed regions as a list of boxes (analysis pixels), largest first. Nearby cells
+    are merged so a dialog comes out as one box; tiny isolated blobs (the mouse
+    pointer, compression noise) are dropped whenever anything bigger changed.
+    """
+    from PIL import ImageFilter
+    w, h = mask.size
+    cw, ch = max(1, w // CELL), max(1, h // CELL)
+    small = mask.resize((cw, ch), resample=2).point(lambda v: 255 if v >= 51 else 0)
+    bridged = small.filter(ImageFilter.MaxFilter(5))  # join cells up to 2 apart
+    act, br = small.load(), bridged.load()
+    seen = set()
+    comps = []
+    for y in range(ch):
+        for x in range(cw):
+            if br[x, y] and (x, y) not in seen:
+                stack, cells, box = [(x, y)], 0, [x, y, x, y]
+                seen.add((x, y))
+                while stack:
+                    cx, cy = stack.pop()
+                    if act[cx, cy]:
+                        cells += 1
+                        box = [min(box[0], cx), min(box[1], cy), max(box[2], cx), max(box[3], cy)]
+                    for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                        if 0 <= nx < cw and 0 <= ny < ch and br[nx, ny] and (nx, ny) not in seen:
+                            seen.add((nx, ny))
+                            stack.append((nx, ny))
+                if cells:
+                    comps.append((cells, box))
+    if not comps:
+        return []
+    # merge boxes that overlap (one panel can split into border + content)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(comps)):
+            for j in range(i + 1, len(comps)):
+                a, b = comps[i][1], comps[j][1]
+                if a[0] <= b[2] + 1 and b[0] <= a[2] + 1 and a[1] <= b[3] + 1 and b[1] <= a[3] + 1:
+                    comps[i] = (comps[i][0] + comps[j][0],
+                                [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])])
+                    del comps[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    comps.sort(key=lambda c: -c[0])
+    if comps[0][0] >= 6:
+        comps = [c for c in comps if c[0] >= 6]
+    return [(b[0] * CELL, b[1] * CELL, min(w, (b[2] + 1) * CELL), min(h, (b[3] + 1) * CELL))
+            for _, b in comps[:max_regions]]
+
+
+def analysis_width(info: dict, area: int = 400 * 226) -> int:
+    """Analysis frame sized by area, not width, so portrait (phone) and landscape
+    recordings are judged by the same thresholds."""
+    W, H = info["width"] or 1920, info["height"] or 1080
+    return max(64, int(round((area * W / H) ** 0.5 / 2)) * 2)
+
+
+def analyze(video: Path, info: dict, fps: float, aw: int, start: float, end: float | None,
+            anchors: list[float], p) -> list[dict]:
+    """
+    Stream the video once at low resolution and decide which moments to keep.
+
+    - Change is measured against the last *kept* frame, so slow drift accumulates.
+      The baseline only advances by keeping a frame; nothing is folded in silently.
+    - A frame is kept once the screen has changed AND come to rest for ~0.35 s:
+      the state after the click, not the animation blur.
+    - During continuous change (a video playing) a frame is forced every max_gap s.
+    - Speech anchors: at every moment the narrator is talking, and ~1.5 s after each
+      sentence (when the result of "click here" shows up), keep the screen if it
+      differs even slightly from the last kept frame. That catches typed commands,
+      a highlighted line, a changed value.
+    """
+    from PIL import Image
+    W, H = info["width"] or 1920, info["height"] or 1080
+    ah = max(2, int(round(aw * H / W / 2)) * 2)
+    p._analysis_w = aw
+    cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", *window_args(start, end), "-i", str(video),
+           "-an", "-vf", f"fps={fps},scale={aw}:{ah}:flags=area", "-f", "rawvideo",
+           "-pix_fmt", "rgb24", "pipe:1"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    size = aw * ah * 3
+    settle_need = max(1, int(round(0.35 * fps)))
+    anchors = sorted(anchors)
+    ai = 0
+    kept: list[dict] = []
+    base = prev = None
+    settled_run = 0
+    last_t = -1e9
+    last = None
+    onset = None  # first sample (since the last keep) where a real change began
+    cand = None   # strongest sample of the change in progress: (t, img, frac, mask, n_samples)
+    i = 0
+
+    def keep(t, img, frac, mask, reason):
+        nonlocal base, last_t, onset
+        nonlocal cand
+        kept.append({"t": t, "img": img, "change": frac, "onset": onset if onset is not None else t,
+                     "bbox": _bbox(mask) if mask is not None else None, "reason": reason})
+        base, last_t, onset, cand = img, t, None, None
+
+    while True:
+        buf = proc.stdout.read(size)
+        if not buf or len(buf) < size:
+            break
+        img = Image.frombytes("RGB", (aw, ah), buf)
+        t = start + i / fps
+        if base is None:
+            keep(t, img, 1.0, None, "start")
+        else:
+            vs_prev, _ = _change(img, prev)
+            settled_run = settled_run + 1 if vs_prev <= p.settle else 0
+            vs_base, mask = _change(img, base)
+            if onset is None and vs_base >= p.change:
+                onset = t
+            if vs_base >= p.change:
+                if cand is None or vs_base > cand[2]:
+                    cand = (t, img, vs_base, mask, (cand[4] if cand else 0) + 1)
+                else:
+                    cand = cand[:4] + (cand[4] + 1,)
+            hit_anchor = False
+            while ai < len(anchors) and anchors[ai] <= t:
+                hit_anchor, ai = True, ai + 1
+            reason = None
+            if vs_base >= p.change and settled_run >= settle_need and t - last_t >= p.min_gap:
+                reason = "settled"
+            elif vs_base >= p.change and onset is not None and t - onset >= p.max_gap \
+                    and t - last_t >= p.max_gap:
+                reason = "ongoing"  # still changing (spinner, animation, playing video)
+            elif hit_anchor and vs_base >= p.anchor and t - last_t >= p.min_gap:
+                reason = "speech"
+            if reason:
+                keep(t, img, vs_base, mask, reason)
+            elif cand is not None and vs_base < p.change:
+                # The screen changed and went back before it ever settled: a flash
+                # (toast, error, closing dialog). Keep its strongest moment rather
+                # than losing it — then the return to normal is a change of its own.
+                if cand[4] >= 2:
+                    ct, cimg, cfrac, cmask, _ = cand
+                    keep(ct, cimg, cfrac, cmask, "transient")
+                else:
+                    cand = None
+                    onset = None
+        prev = img
+        last = (t, img)
+        i += 1
+    err = proc.stderr.read().decode(errors="replace")
+    proc.wait()
+    if proc.returncode not in (0, None) and not kept:
+        die(f"frame analysis failed: {err.strip()[:400]}")
+    if last and base is not None and last[1] is not base:
+        frac, mask = _change(last[1], base)
+        if frac >= p.anchor:
+            keep(last[0], last[1], frac, mask, "end")
+    log(f"analysed {i} samples at {fps} fps, {len(kept)} moments selected")
+    return prune(kept, p.max_frames)
+
+
+def prune(kept: list[dict], max_frames: int) -> list[dict]:
+    """Over budget: drop the least informative frames first, keep both ends, and
+    recompute each survivor's change/box against the frame now before it."""
+    weight = {"ongoing": 0.3, "transient": 0.8, "settled": 1.0, "speech": 1.0}
+    changed = False
+    while len(kept) > max_frames:
+        inner = range(1, len(kept) - 1)
+        j = min(inner, key=lambda k: max(kept[k]["change"], 0.01 if kept[k]["reason"] == "speech" else 0)
+                * weight.get(kept[k]["reason"], 1.0))
+        del kept[j]
+        if j < len(kept):
+            frac, mask = _change(kept[j]["img"], kept[j - 1]["img"])
+            kept[j]["change"], kept[j]["bbox"] = frac, _bbox(mask)
+        changed = True
+    if changed:
+        log(f"frame budget: kept {len(kept)}")
+    return kept
+
+
+def export_frames(video: Path, kept: list[dict], info: dict, aw: int, width: int,
+                  dest: Path, annotate: bool) -> list[dict]:
+    """Extract the chosen moments at full detail and mark what changed."""
+    from PIL import Image, ImageDraw
     dest.mkdir(parents=True, exist_ok=True)
-    vf = f"fps={fps},scale='min({width},iw)':-2"
-    cmd = [
-        FFMPEG, "-hide_banner", "-loglevel", "error", *window_args(start, end), "-i", str(video),
-        "-an", "-vf", vf, "-q:v", "3", str(dest / "s_%06d.jpg"),
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        die(f"frame extraction failed: {r.stderr.strip()[:400]}")
-    files = sorted(dest.glob("s_*.jpg"))
-    # With the fps filter, output frame k (0-based) represents time start + k / fps.
-    return [(start + i / fps, f) for i, f in enumerate(files)]
+    W = info["width"] or 1920
+    frames = []
+    for n, k in enumerate(kept, 1):
+        name = f"frame_{n:03d}_{ts(k['t']).replace(':', 'm')}s.jpg"
+        f = dest / name
+        cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{k['t']:.3f}",
+               "-i", str(video), "-frames:v", "1", "-vf", f"scale='min({width},iw)':-2", "-q:v", "3", str(f)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not f.exists():  # seeking past the last frame etc.
+            k["img"].resize((min(width, W), int(min(width, W) * k["img"].size[1] / k["img"].size[0]))).save(f, quality=85)
+        regions = []
+        if k["bbox"] and k["reason"] != "start":
+            sx = W / aw
+            regions = [[int(v * sx) for v in b] for b in k["bbox"]]
+            if annotate:
+                with Image.open(f) as im:
+                    im = im.convert("RGB")
+                    fx = im.size[0] / W
+                    d = ImageDraw.Draw(im)
+                    for rb in regions:
+                        x0, y0, x1, y1 = [int(v * fx) for v in rb]
+                        pad = 4
+                        d.rectangle([max(0, x0 - pad), max(0, y0 - pad),
+                                     min(im.size[0] - 1, x1 + pad), min(im.size[1] - 1, y1 + pad)],
+                                    outline=(255, 40, 40), width=3)
+                    im.save(f, quality=88)
+        frames.append({"t": round(k["t"], 2), "onset": round(k["onset"], 2),
+                       "before": round(max(0.0, k["onset"] - 0.15), 2),
+                       "file": f"frames/{name}", "reason": k["reason"],
+                       "change": round(k["change"], 4),
+                       "regions": [{"x": b[0], "y": b[1], "w": b[2] - b[0], "h": b[3] - b[1]} for b in regions]})
+    return frames
+
+
+def contact_sheets(out: Path, frames: list[dict], cols: int = 3, rows: int = 3, tile_w: int = 480) -> list[str]:
+    """Labelled 3x3 overview grids of the keyframes — a cheap first look."""
+    from PIL import Image, ImageDraw, ImageFont
+    sheets_dir = out / "sheets"
+    sheets_dir.mkdir(exist_ok=True)
+    try:
+        font = ImageFont.load_default(size=18)
+    except TypeError:
+        font = ImageFont.load_default()
+    per = cols * rows
+    paths = []
+    for si in range(0, len(frames), per):
+        group = frames[si:si + per]
+        tiles = []
+        for fr in group:
+            with Image.open(out / fr["file"]) as im:
+                im = im.convert("RGB")
+                th = int(tile_w * im.size[1] / im.size[0])
+                tiles.append((fr, im.resize((tile_w, th))))
+        th = max(t.size[1] for _, t in tiles)
+        bar = 26
+        r = (len(tiles) + cols - 1) // cols
+        sheet = Image.new("RGB", (cols * tile_w + (cols - 1) * 6, r * (th + bar) + (r - 1) * 6), (255, 255, 255))
+        d = ImageDraw.Draw(sheet)
+        for k, (fr, t) in enumerate(tiles):
+            x = (k % cols) * (tile_w + 6)
+            y = (k // cols) * (th + bar + 6)
+            d.rectangle([x, y, x + tile_w, y + bar], fill=(30, 30, 30))
+            num = fr["file"].split("_")[1]
+            d.text((x + 6, y + 3), f"#{num}  {ts(fr['t'])}  {fr['reason']}", fill=(255, 255, 255), font=font)
+            sheet.paste(t, (x, y + bar))
+        name = f"sheets/sheet_{si // per + 1:02d}.jpg"
+        sheet.save(out / name, quality=82)
+        paths.append(name)
+    return paths
 
 
 def grab_frames(video: Path, times: list[float], crop: str | None, dest: Path) -> list[Path]:
@@ -256,7 +581,7 @@ def grab_frames(video: Path, times: list[float], crop: str | None, dest: Path) -
     dest.mkdir(parents=True, exist_ok=True)
     out = []
     for t in times:
-        tag = ts(t).replace(":", "m") + "s" + (f"_crop{crop.replace(',', '-')}" if crop else "")
+        tag = tsp(t).replace(":", "m") + "s" + (f"_crop{crop.replace(',', '-')}" if crop else "")
         f = dest / f"grab_{tag}.png"
         cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{t:.3f}", "-i", str(video),
                "-frames:v", "1"]
@@ -276,74 +601,6 @@ def parse_time(v: str) -> float:
     for x in parts:
         sec = sec * 60 + x
     return sec
-
-
-# ----------------------------------------------------------------- frame choice
-
-def _thumb(path: Path):
-    from PIL import Image
-    with Image.open(path) as im:
-        return im.convert("L").resize((384, 216))
-
-
-def _diff(a, b, pixel_tol: int = 18) -> float:
-    """Fraction of pixels that changed noticeably between two thumbnails."""
-    from PIL import ImageChops
-    d = ImageChops.difference(a, b).point(lambda v: 255 if v > pixel_tol else 0)
-    hist = d.histogram()
-    return hist[255] / float(a.size[0] * a.size[1])
-
-
-def select_keyframes(samples, change_thresh: float, settle_thresh: float, max_gap: float,
-                     max_frames: int, anchors=(), anchor_thresh: float = 0.0005
-                     ) -> list[tuple[float, Path, float]]:
-    """
-    Pass 1 — keep a sample when the screen has *settled* (little change from the
-    previous sample) and differs meaningfully from the last kept frame. This skips the
-    blur of scrolling/typing and keeps the resulting state. `max_gap` forces a frame
-    during long continuously-changing stretches (e.g. a video playing on screen).
-
-    Pass 2 — speech anchors: for each moment the narrator is talking, if the screen
-    then differs even slightly (anchor_thresh) from the frame that would represent it,
-    add that moment too. Small but important changes (a typed command, a highlighted
-    line) are usually what the speaker is pointing at.
-    """
-    if not samples:
-        return []
-    thumbs = [_thumb(p) for _, p in samples]
-    keep = {0: 1.0}
-    last_i = 0
-    for i in range(1, len(samples)):
-        vs_prev = _diff(thumbs[i], thumbs[i - 1])
-        vs_kept = _diff(thumbs[i], thumbs[last_i])
-        settled = vs_prev <= settle_thresh
-        long_gap = samples[i][0] - samples[last_i][0] >= max_gap
-        if vs_kept >= change_thresh and (settled or long_gap):
-            keep[i] = vs_kept
-            last_i = i
-    if _diff(thumbs[-1], thumbs[last_i]) >= change_thresh:
-        keep[len(samples) - 1] = 1.0
-    base = set(keep)
-
-    step = samples[1][0] - samples[0][0] if len(samples) > 1 else 1.0
-    for a in anchors:
-        i = min(len(samples) - 1, max(0, int(round((a - samples[0][0]) / step))))
-        active = max(k for k in keep if k <= i) if any(k <= i for k in keep) else 0
-        if i != active:
-            d = _diff(thumbs[i], thumbs[active])
-            if d >= anchor_thresh:
-                keep[i] = d
-
-    order = sorted(keep)
-    if len(order) > max_frames:
-        # Drop speech anchors first (smallest change first), then thin evenly in time.
-        extras = sorted((k for k in order if k not in base), key=lambda k: keep[k])
-        while len(order) > max_frames and extras:
-            order.remove(extras.pop(0))
-        if len(order) > max_frames:
-            idx = sorted({round(k * (len(order) - 1) / (max_frames - 1)) for k in range(max_frames)})
-            order = [order[j] for j in idx]
-    return [(samples[i][0], samples[i][1], keep[i]) for i in order]
 
 
 def load_transcript_file(path: Path) -> list[dict]:
@@ -531,6 +788,13 @@ def transcribe(wav: Path, backend: str, model: str, lang: str | None, prompt: st
 
 # ----------------------------------------------------------------------- output
 
+def tsp(sec: float) -> str:
+    """mm:ss.s — precise enough to scrub to, or to --grab the instant before a change."""
+    sec = max(0.0, sec)
+    m, s_ = divmod(sec, 60)
+    return f"{int(m):02d}:{s_:04.1f}"
+
+
 def ts(sec: float) -> str:
     sec = max(0, int(round(sec)))
     h, rem = divmod(sec, 3600)
@@ -542,14 +806,26 @@ LOW_CONF = 0.6
 
 
 def write_context(out: Path, video: Path, info: dict, frames: list[dict],
-                  segments, backend, language, notes: list[str]) -> Path:
+                  segments, backend, language, notes: list[str], sheets=(), started=None) -> Path:
+    from datetime import timedelta
+    rec_start, rec_src = started or (None, None)
+
+    def clock(t):
+        return f" ≈{(rec_start + timedelta(seconds=t)).strftime('%H:%M:%S')}" if rec_start else ""
+
     lines = [
         f"# Video context: {video.name}",
         "",
         f"- Source: `{video}`",
         f"- Duration: {ts(info['duration'])} · Resolution: {info['width']}x{info['height']}",
-        f"- Keyframes: {len(frames)} (in `frames/`, only moments where the screen changed)",
+        f"- Keyframes: {len(frames)} (in `frames/`, only moments where the screen changed; "
+        f"red box = region that changed since the previous keyframe)",
     ]
+    if sheets:
+        lines.append(f"- Overview sheets (9 keyframes each): {', '.join(f'`{x}`' for x in sheets)}")
+    if rec_start:
+        lines.append(f"- Recording started ≈ {rec_start.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')} — from "
+                     f"{rec_src}. The ≈HH:MM:SS after each frame is that start + video time, for matching logs.")
     if segments is not None:
         low = sum(1 for x in segments if x.get("conf") is not None and x["conf"] < LOW_CONF)
         lines.append(f"- Transcript: {len(segments)} segments · backend: {backend} · language: {language}"
@@ -571,7 +847,16 @@ def write_context(out: Path, video: Path, info: dict, frames: list[dict],
     for i, fr in enumerate(frames):
         start = fr["t"]
         end = frames[i + 1]["t"] if i + 1 < len(frames) else float("inf")
-        lines.append(f"### [{ts(start)}] {fr['file']}")
+        regs = fr.get("regions") or []
+        where = (" — changed: " + "; ".join(f"x={r['x']} y={r['y']} w={r['w']} h={r['h']}" for r in regs)
+                 + f" ({fr['change'] * 100:.1f}% of screen)") if regs else ""
+        began = ""
+        if fr.get("reason") in ("settled", "ongoing") and fr.get("onset") is not None \
+                and fr["t"] - fr["onset"] >= 0.2:
+            began = f" · change began {tsp(fr['onset'])} (grab {tsp(fr['before'])} for the moment before it)"
+        elif fr.get("reason") not in ("start", None) and fr.get("before") is not None:
+            began = f" · moment before: {tsp(fr['before'])}"
+        lines.append(f"### [{tsp(start)}{clock(start)}] {fr['file']} · {fr.get('reason', '')}{where}{began}")
         mid = lambda s: (s["start"] + s["end"]) / 2
         said = [s for s in segs if (i == 0 or start <= mid(s)) and mid(s) < end]
         if said:
@@ -597,17 +882,24 @@ def main() -> None:
     ap.add_argument("video", nargs="?", help="path to the video (Windows paths OK under WSL)")
     ap.add_argument("--latest", action="store_true", help="use the newest screen recording found")
     ap.add_argument("--out", help="output dir (default: ./.video-context/<name>)")
-    ap.add_argument("--max-frames", type=int, default=int(os.environ.get("VIDEO_CONTEXT_MAX_FRAMES", 30)))
-    ap.add_argument("--width", type=int, default=1280, help="max keyframe width in px")
-    ap.add_argument("--sample-fps", type=float, default=0, help="sampling rate (0 = auto by length)")
-    ap.add_argument("--change", type=float, default=0.02,
-                    help="min fraction of screen that must change to keep a new frame")
-    ap.add_argument("--settle", type=float, default=0.01,
-                    help="max change vs previous sample for the screen to count as settled")
+    ap.add_argument("--max-frames", type=int,
+                    default=int(os.environ["VIDEO_CONTEXT_MAX_FRAMES"]) if os.environ.get("VIDEO_CONTEXT_MAX_FRAMES") else None,
+                    help="frame budget (default 40, or 60 for recordings over 10 min)")
+    ap.add_argument("--width", type=int, default=1568,
+                    help="max keyframe width in px (default 1568: readable small text, and within what "
+                         "current vision models accept without downscaling much)")
+    ap.add_argument("--sample-fps", type=float, default=0, help="analysis rate (0 = auto: 12/6/3 by length)")
+    ap.add_argument("--change", type=float, default=0.0025,
+                    help="fraction of the screen that must change to count as an event (lower = more frames)")
+    ap.add_argument("--settle", type=float, default=0.0015,
+                    help="max change between samples for the screen to count as at rest")
+    ap.add_argument("--min-gap", type=float, default=0.45, help="min seconds between kept frames")
+    ap.add_argument("--no-annotate", action="store_true", help="don't draw changed-region boxes")
+    ap.add_argument("--no-sheets", action="store_true", help="don't build contact sheets")
     ap.add_argument("--anchor", type=float, default=0.0005,
                     help="min change to add an extra frame at a moment of speech (catches typing)")
-    ap.add_argument("--max-gap", type=float, default=20.0,
-                    help="force a frame after this many seconds of continuous change")
+    ap.add_argument("--max-gap", type=float, default=3.0,
+                    help="keep a frame after this many seconds of continuous change (spinners, animations)")
     ap.add_argument("--backend", default=os.environ.get("VIDEO_CONTEXT_BACKEND", "auto"),
                     choices=["auto", "mlx", "faster-whisper", "openai-whisper"])
     ap.add_argument("--model", default=os.environ.get("VIDEO_CONTEXT_MODEL", DEFAULT_MODEL),
@@ -679,11 +971,13 @@ def main() -> None:
         elif args.no_transcribe:
             notes.append("transcription skipped (--no-transcribe)")
         elif not info["has_audio"]:
-            notes.append("video has no audio track — was the microphone enabled when recording?")
+            notes.append("video has no audio track (no narration) — work from the frames and any description "
+                         "the user gave in chat; if it's their own recording, the mic may have been off")
         else:
             wav = extract_audio(video, tmpd, start, end)
             if audio_is_silent(wav):
-                notes.append("audio track is silent — the microphone was probably off while recording")
+                notes.append("audio track is silent (no narration) — work from the frames and any description "
+                             "the user gave in chat; if it's their own recording, the mic may have been off")
             else:
                 segments, backend, language = transcribe(wav, args.backend, args.model,
                                                          args.lang, args.prompt)
@@ -705,33 +999,38 @@ def main() -> None:
         # --- frames
         span = (end or info["duration"]) - start
         fps = args.sample_fps or auto_sample_fps(span)
-        log(f"sampling frames at {fps} fps …")
-        samples = extract_samples(video, fps, args.width, tmpd / "samples", start, end)
-        anchors = [(s["start"] + s["end"]) / 2 for s in (segments or [])]
-        kept = select_keyframes(samples, args.change, args.settle, args.max_gap,
-                                max(2, args.max_frames), anchors, args.anchor)
+        if args.max_frames is None:
+            args.max_frames = 40 if span <= 600 else 60
+        anchors = []
+        for x in segments or []:
+            anchors += [(x["start"] + x["end"]) / 2, x["end"] + 1.5]  # while speaking + result state
+        log(f"analysing frames at {fps} fps …")
+        aw = analysis_width(info)
+        kept = analyze(video, info, fps, aw, start, end, anchors, args)
         if len(kept) >= args.max_frames:
-            notes.append(f"frame cap ({args.max_frames}) reached; some screen states were dropped — "
-                         f"re-run with a higher --max-frames for more detail")
-        frames = []
-        for n, (t, p, score) in enumerate(kept, 1):
-            name = f"frame_{n:03d}_{ts(t).replace(':', 'm')}s.jpg"
-            shutil.copy2(p, out / "frames" / name)
-            frames.append({"t": round(t, 2), "file": f"frames/{name}", "change": round(score, 3)})
-        log(f"kept {len(frames)} keyframes out of {len(samples)} samples")
+            notes.append(f"frame budget ({args.max_frames}) reached; the least informative moments were "
+                         f"dropped — for more detail re-run a window with --start/--end")
+        frames = export_frames(video, kept, info, aw, args.width, out / "frames", not args.no_annotate)
+        sheets = [] if args.no_sheets else contact_sheets(out, frames)
+        log(f"kept {len(frames)} keyframes")
 
+    started = recording_start(video, info)
     if segments is not None:
         (out / "transcript.json").write_text(json.dumps(segments, ensure_ascii=False, indent=1),
                                              encoding="utf-8")
-    meta = {"video": str(video), **info, "window": [start, end], "sample_fps": fps, "frames": frames,
+    meta = {"video": str(video), **info, "window": [start, end],
+            "recording_start": started[0].isoformat() if started and started[0] else None, "sample_fps": fps, "frames": frames,
+            "sheets": sheets,
             "backend": backend, "language": language, "model": args.model, "notes": notes}
     (out / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-    ctx = write_context(out, video, info, frames, segments, backend, language, notes)
+    ctx = write_context(out, video, info, frames, segments, backend, language, notes, sheets, started)
 
-    # stdout is for Claude: a short, parseable summary
+    # stdout is for the calling agent: a short, parseable summary
     print(f"CONTEXT={ctx}")
     print(f"FRAMES_DIR={out / 'frames'}")
     print(f"FRAME_COUNT={len(frames)}")
+    if sheets:
+        print(f"SHEETS={' '.join(str(out / x) for x in sheets)}")
     print(f"TRANSCRIPT_SEGMENTS={len(segments) if segments is not None else 'none'}")
     if segments:
         print("AUDIO=speech — the narration is the user's actual request; read it before concluding anything")
