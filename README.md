@@ -54,6 +54,7 @@ On macOS, turn the microphone on before you record: Cmd+Shift+5 → Options → 
 - macOS (Apple Silicon uses the faster MLX backend), Linux, or Windows with WSL
 - `bash`, and `curl` or `wget`
 - Any video format ffmpeg can decode: MOV, MP4, WebM, MKV, AVI, GIF and more
+- Audio-only files too (voice memos, call recordings: M4A, MP3, WAV, OGG/Opus, FLAC…), loaded as a timestamped transcript
 - Internet access on the first run, for the dependencies and the speech model
 
 ## Options

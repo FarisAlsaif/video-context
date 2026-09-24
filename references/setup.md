@@ -52,5 +52,5 @@ Override with `export VIDEO_CONTEXT_MODEL=…` (and optionally `VIDEO_CONTEXT_LA
 - **Model download fails:** The first run fetches the model from huggingface.co. Behind a proxy, set `HTTPS_PROXY`. The model is cached afterwards (`~/.cache/huggingface`).
 - **Too many or too few frames:** `--change` (default 0.0025, the share of the screen that must change) controls the main frames, and `--anchor` (default 0.0005) controls the extra frames taken while you speak. Lower values give more frames. `--sample-fps` sets how often the screen is checked (default 12, dropping to 6 and 3 for long recordings).
 - **Slow on WSL:** Reading large files from `/mnt/c` is slower. Copying the video into the Linux filesystem first helps for long recordings.
-- **Wrong recording picked by `--latest`:** Pass the path explicitly. `--latest` only looks at .mov .mp4 .mkv .webm .m4v .avi .gif .flv .wmv .ts .3gp files. An explicit path can be any format ffmpeg reads.
+- **Wrong recording picked by `--latest`:** Pass the path explicitly. `--latest` only looks at .mov .mp4 .mkv .webm .m4v .avi .gif .flv .wmv .ts .3gp files. An explicit path can be any format ffmpeg reads, including audio-only files.
 - **Formats checked with both the system and the bundled ffmpeg:** H.264, HEVC, VP9, AV1, ProRes, MPEG-4 AVI, GIF, rotated MP4, and WebM without a duration.
