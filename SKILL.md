@@ -1,6 +1,6 @@
 ---
 name: video-context
-description: Watch a screen recording and load what it shows and says into the session as context — keyframes of the screen plus a timestamped transcript of the narration, aligned so "this" and "here" resolve to what was on screen. Use this whenever the user shares, drags in, or mentions a video file (.mov, .mp4, .mkv, .webm), says they recorded their screen, asks you to "watch", "look at", or "check" a recording or video, or refers to "the recording I just made" / "my latest recording" — even if they don't say "transcribe" or name this skill. Works on macOS, Linux and WSL.
+description: Watch a screen recording and load what it shows and says into the session as context — keyframes of the screen plus a timestamped transcript of the narration, aligned so "this" and "here" resolve to what was on screen. Also takes audio-only files (voice notes, call or meeting recordings) and loads them as a timestamped transcript. Use this whenever the user shares, drags in, or mentions a video file (.mov, .mp4, .mkv, .webm) or an audio file (.m4a, .mp3, .wav, .ogg, .opus, .flac), says they recorded their screen, asks you to "watch", "look at", "listen to", or "check" a recording, video or voice note, or refers to "the recording I just made" / "my latest recording" — even if they don't say "transcribe" or name this skill. Works on macOS, Linux and WSL.
 license: MIT
 compatibility: Needs bash and curl or wget (macOS, Linux or WSL); everything else installs itself without sudo. The agent must be able to run shell commands and view image files.
 ---
@@ -16,7 +16,9 @@ How frames are chosen, so you know what to trust: the video is scanned 12× a se
 - **A path in the message.** Pass it to the script as given, in quotes, and don't `ls` it first. Drag-and-drop pastes a path with escaped spaces; WSL may give a Windows path (`C:\Users\…\Videos\Captures\clip.mp4`). macOS also puts an invisible narrow no-break space before "AM"/"PM" in recording names, so a path you or the user typed won't match exactly, and `ls` reports "No such file". The script matches such names itself.
 - **"My latest recording", "the video I just made", or no path.** Use `--latest`. It searches the usual save locations (the macOS screenshot folder and Desktop; on WSL, the Windows `Videos\Captures` and `Videos\Screen Recordings` folders, including OneDrive). It logs which file it picked and how old it is. If that file is more than about an hour old, confirm with the user that it's the right one before going deep.
 
-Any format ffmpeg can decode works: MOV/MP4 in H.264 or HEVC (macOS, iPhone, Windows, Teams/Zoom), WebM in VP9 or AV1 (Chrome, Loom, browser recorders), MKV (OBS), AVI, ProRes and GIF. Phone recordings with a rotation flag are handled, as are browser WebM files that don't store their duration. Audio-only files are not supported, since there must be a video stream.
+Any format ffmpeg can decode works: MOV/MP4 in H.264 or HEVC (macOS, iPhone, Windows, Teams/Zoom), WebM in VP9 or AV1 (Chrome, Loom, browser recorders), MKV (OBS), AVI, ProRes and GIF. Phone recordings with a rotation flag are handled, as are browser WebM files that don't store their duration.
+
+**Audio-only files** (M4A voice memos, MP3, WAV, OGG/Opus from WhatsApp or Telegram, FLAC, or anything else ffmpeg reads) work too: pass the path the same way. Cover art embedded in an MP3/M4A is ignored. There are no frames, so `context.md` is just the timestamped transcript, and the script prints `MEDIA=audio`. `--latest` only looks for videos, so an audio file always needs its path.
 
 ## 2. Run it (setup is automatic)
 
@@ -44,9 +46,11 @@ Options worth using:
 
 Transcription is well under real time on Apple Silicon (MLX) and roughly real time on a WSL CPU, and the first run also downloads the model (about 1 GB). For videos over a few minutes, tell the user it's processing and use a generous timeout (10 minutes or more).
 
-Stdout ends with `CONTEXT=`, `FRAMES_DIR=`, `FRAME_COUNT=`, `SHEETS=`, `TRANSCRIPT_SEGMENTS=`, `AUDIO=` and any `NOTE=` lines. The output goes to `./.video-context/<video-name>/`, which is git-ignored automatically.
+Stdout ends with `CONTEXT=`, `MEDIA=` (`video` or `audio`), `FRAMES_DIR=` (video only), `FRAME_COUNT=`, `SHEETS=`, `TRANSCRIPT_SEGMENTS=`, `AUDIO=` and any `NOTE=` lines. The output goes to `./.video-context/<video-name>/`, which is git-ignored automatically.
 
 ## 3. Take it in
+
+**Audio only (`MEDIA=audio`):** there's nothing to look at, so skip the frame steps below. Read `context.md` in full, list every distinct request or question in it (step 3 below), treat ⚠ lines as in step 4 (re-run a window with `--start/--end --model large-v3`, or ask), then connect what was said to the repo (step 9). `--grab` doesn't apply. If the speaker refers to something on screen ("this error here"), say the recording is audio only and ask for a screenshot or the text.
 
 This step needs a way to view image files (an image-reading or file-viewing tool). If you can't view images, say so up front. Work from the transcript and the `changed:` regions, and ask the user to describe what matters on screen. Don't present conclusions about the visuals you haven't seen.
 
@@ -121,6 +125,7 @@ The recording is now part of the session context. When the user refers back to i
 ## Problems the NOTE lines point to
 
 - **No `AUDIO=speech` line.** Check the NOTE lines for why. Never assume a recording has no narration without the script's word for it.
+- **"audio file is silent".** An audio-only file with no sound in it. Check it's the right file, and ask the user to type the request or re-record.
 - **"no audio track" / "audio track is silent".** The microphone was off while recording. On macOS, Cmd+Shift+5 records without a microphone by default (Options → Microphone). Tell the user plainly and work from the frames. If the frames alone don't make the request clear, ask them to type it or re-record with the mic on.
 - **"no transcription backend installed".** Something bypassed `run.sh`. Re-run through `run.sh`.
 - **"transcription failed … download".** The first run needs internet access to fetch the model. Details are in `references/setup.md`.

@@ -18,6 +18,9 @@ What it produces (in the output directory):
   transcript.json   raw segments [{start, end, text}]
   meta.json         video info, settings, backend used
 
+Audio-only files (voice notes, call recordings) are accepted too: no frames, and
+context.md is the timestamped transcript.
+
 Works on macOS and WSL (and plain Linux). Uses ffmpeg from PATH if present, otherwise the
 static ffmpeg bundled with the imageio-ffmpeg package (no sudo / Homebrew needed).
 Normally launched through run.sh, which installs everything on first use.
@@ -46,7 +49,8 @@ import time
 import unicodedata
 from pathlib import Path
 
-# Only used by --latest to find recordings; an explicit path can be any format ffmpeg reads.
+# Only used by --latest to find recordings; an explicit path can be any format ffmpeg reads,
+# including audio-only files (voice notes, call recordings), which get a transcript-only context.
 VIDEO_EXTS = {".mov", ".mp4", ".mkv", ".webm", ".m4v", ".avi", ".gif", ".flv", ".wmv", ".ts", ".3gp"}
 
 
@@ -251,10 +255,13 @@ def probe(video: Path) -> dict:
     # Parse `ffmpeg -i` output so ffprobe isn't needed (the bundled ffmpeg has no ffprobe).
     r = subprocess.run([FFMPEG, "-hide_banner", "-i", str(video)], capture_output=True, text=True)
     err = r.stderr
-    vline = next((l for l in err.splitlines() if re.search(r"Stream #.*: Video:", l)), None)
-    if vline is None:
-        die(f"no video stream found (ffmpeg says: {err.strip()[-300:]})")
-    res = re.search(r"\b(\d{2,5})x(\d{2,5})\b", vline)
+    # Cover art in an MP3/M4A shows up as a video stream marked "(attached pic)"; that's not video.
+    vline = next((l for l in err.splitlines()
+                  if re.search(r"Stream #.*: Video:", l) and "attached pic" not in l), None)
+    has_audio = bool(re.search(r"Stream #.*: Audio:", err))
+    if vline is None and not has_audio:
+        die(f"no video or audio stream found (ffmpeg says: {err.strip()[-300:]})")
+    res = re.search(r"\b(\d{2,5})x(\d{2,5})\b", vline) if vline else None
     dm = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", err)
     dur = int(dm.group(1)) * 3600 + int(dm.group(2)) * 60 + float(dm.group(3)) if dm else 0.0
     ct = re.search(r"creation_time\s*:\s*(\S+)", err)
@@ -269,7 +276,8 @@ def probe(video: Path) -> dict:
     if not dur:
         # Browser/MediaRecorder WebM files often have no duration in the header:
         # measure it by reading the stream without decoding.
-        r2 = subprocess.run([FFMPEG, "-hide_banner", "-i", str(video), "-map", "0:v:0", "-c", "copy",
+        stream = "0:v:0" if vline else "0:a:0"
+        r2 = subprocess.run([FFMPEG, "-hide_banner", "-i", str(video), "-map", stream, "-c", "copy",
                              "-f", "null", "-"], capture_output=True, text=True)
         times = re.findall(r"time=(\d+):(\d+):([\d.]+)", r2.stderr)
         if times:
@@ -280,7 +288,8 @@ def probe(video: Path) -> dict:
         "rotation": rotation,
         "width": w,
         "height": h,
-        "has_audio": bool(re.search(r"Stream #.*: Audio:", err)),
+        "has_audio": has_audio,
+        "audio_only": vline is None,
         "creation_time": ct.group(1) if ct else None,
     }
 
@@ -813,25 +822,49 @@ def write_context(out: Path, video: Path, info: dict, frames: list[dict],
     def clock(t):
         return f" ≈{(rec_start + timedelta(seconds=t)).strftime('%H:%M:%S')}" if rec_start else ""
 
+    audio_only = info.get("audio_only")
     lines = [
-        f"# Video context: {video.name}",
+        f"# {'Audio' if audio_only else 'Video'} context: {video.name}",
         "",
         f"- Source: `{video}`",
-        f"- Duration: {ts(info['duration'])} · Resolution: {info['width']}x{info['height']}",
-        f"- Keyframes: {len(frames)} (in `frames/`, only moments where the screen changed; "
-        f"red box = region that changed since the previous keyframe)",
     ]
+    if audio_only:
+        lines.append(f"- Duration: {ts(info['duration'])} · audio only (no screen to show, so no keyframes)")
+    else:
+        lines += [
+            f"- Duration: {ts(info['duration'])} · Resolution: {info['width']}x{info['height']}",
+            f"- Keyframes: {len(frames)} (in `frames/`, only moments where the screen changed; "
+            f"red box = region that changed since the previous keyframe)",
+        ]
     if sheets:
         lines.append(f"- Overview sheets (9 keyframes each): {', '.join(f'`{x}`' for x in sheets)}")
     if rec_start:
         lines.append(f"- Recording started ≈ {rec_start.strftime('%Y-%m-%d %H:%M:%S %Z (UTC%z)')} — from "
-                     f"{rec_src}. The ≈HH:MM:SS after each frame is that start + video time, for matching logs.")
+                     f"{rec_src}. The ≈HH:MM:SS after each {'line' if audio_only else 'frame'} is that start "
+                     f"+ recording time, for matching logs.")
     if segments is not None:
         low = sum(1 for x in segments if x.get("conf") is not None and x["conf"] < LOW_CONF)
         lines.append(f"- Transcript: {len(segments)} segments · backend: {backend} · language: {language}"
                      + (f" · {low} low-confidence line(s) marked ⚠" if low else ""))
     for n in notes:
         lines.append(f"- NOTE: {n}")
+    if audio_only:
+        lines += [
+            "",
+            "Lines marked ⚠ may be mis-heard: re-transcribe that window with a bigger model if one matters.",
+            "",
+            "## Transcript",
+            "",
+        ]
+        for s in segments or []:
+            flag = " ⚠ low-confidence" if s.get("conf") is not None and s["conf"] < LOW_CONF else ""
+            lines.append(f"- [{ts(s['start'])}–{ts(s['end'])}{clock(s['start'])}]{flag} {s['text']}")
+        if segments is not None and not segments:
+            lines.append("(empty)")
+        lines.append("")
+        path = out / "context.md"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return path
     lines += [
         "",
         "Each section below is one screen state. The narration listed under a frame was",
@@ -873,6 +906,25 @@ def write_context(out: Path, video: Path, info: dict, frames: list[dict],
     path = out / "context.md"
     path.write_text("\n".join(lines), encoding="utf-8")
     return path
+
+
+def extract_keyframes(video: Path, info: dict, fps: float, span: float, start: float, end: float | None,
+                      segments, args, notes: list[str], out: Path):
+    if args.max_frames is None:
+        args.max_frames = 40 if span <= 600 else 60
+    anchors = []
+    for x in segments or []:
+        anchors += [(x["start"] + x["end"]) / 2, x["end"] + 1.5]  # while speaking + result state
+    log(f"analysing frames at {fps} fps …")
+    aw = analysis_width(info)
+    kept = analyze(video, info, fps, aw, start, end, anchors, args)
+    if len(kept) >= args.max_frames:
+        notes.append(f"frame budget ({args.max_frames}) reached; the least informative moments were "
+                     f"dropped — for more detail re-run a window with --start/--end")
+    frames = export_frames(video, kept, info, aw, args.width, out / "frames", not args.no_annotate)
+    sheets = [] if args.no_sheets else contact_sheets(out, frames)
+    log(f"kept {len(frames)} keyframes")
+    return frames, sheets
 
 
 # ------------------------------------------------------------------------- main
@@ -931,13 +983,18 @@ def main() -> None:
         ap.error("give a video path or --latest")
 
     info = probe(video)
-    log(f"{video.name}: {ts(info['duration'])}, {info['width']}x{info['height']}, "
-        f"audio={'yes' if info['has_audio'] else 'no'}")
+    if info["audio_only"]:
+        log(f"{video.name}: {ts(info['duration'])}, audio only — transcript only, no frames")
+    else:
+        log(f"{video.name}: {ts(info['duration'])}, {info['width']}x{info['height']}, "
+            f"audio={'yes' if info['has_audio'] else 'no'}")
 
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", video.stem).strip("-")[:60] or "video"
     base_out = Path(args.out) if args.out else Path.cwd() / ".video-context" / slug
 
     if args.grab:
+        if info["audio_only"]:
+            die("--grab needs a video stream; this file is audio only")
         times = [parse_time(t) for t in args.grab.split(",") if t.strip()]
         for f in grab_frames(video, times, args.crop, base_out / "grabs"):
             print(f"GRAB={f}")
@@ -951,7 +1008,9 @@ def main() -> None:
                                 f"{ts(end if end else info['duration']).replace(':', 'm')}"
     if out.exists():
         shutil.rmtree(out)
-    (out / "frames").mkdir(parents=True)
+    out.mkdir(parents=True)
+    if not info["audio_only"]:
+        (out / "frames").mkdir()
     root = out.parent if not args.out else None
     if root is not None and root.name == ".video-context":
         gi = root / ".gitignore"
@@ -975,7 +1034,10 @@ def main() -> None:
                          "the user gave in chat; if it's their own recording, the mic may have been off")
         else:
             wav = extract_audio(video, tmpd, start, end)
-            if audio_is_silent(wav):
+            if audio_is_silent(wav) and info["audio_only"]:
+                notes.append("audio file is silent — nothing to transcribe; check the right file was given "
+                             "and that the mic was recording")
+            elif audio_is_silent(wav):
                 notes.append("audio track is silent (no narration) — work from the frames and any description "
                              "the user gave in chat; if it's their own recording, the mic may have been off")
             else:
@@ -996,23 +1058,12 @@ def main() -> None:
             if args.keep_audio:
                 shutil.copy2(wav, out / "audio.wav")
 
-        # --- frames
-        span = (end or info["duration"]) - start
-        fps = args.sample_fps or auto_sample_fps(span)
-        if args.max_frames is None:
-            args.max_frames = 40 if span <= 600 else 60
-        anchors = []
-        for x in segments or []:
-            anchors += [(x["start"] + x["end"]) / 2, x["end"] + 1.5]  # while speaking + result state
-        log(f"analysing frames at {fps} fps …")
-        aw = analysis_width(info)
-        kept = analyze(video, info, fps, aw, start, end, anchors, args)
-        if len(kept) >= args.max_frames:
-            notes.append(f"frame budget ({args.max_frames}) reached; the least informative moments were "
-                         f"dropped — for more detail re-run a window with --start/--end")
-        frames = export_frames(video, kept, info, aw, args.width, out / "frames", not args.no_annotate)
-        sheets = [] if args.no_sheets else contact_sheets(out, frames)
-        log(f"kept {len(frames)} keyframes")
+        # --- frames (none for an audio-only file)
+        frames, sheets, fps = [], [], None
+        if not info["audio_only"]:
+            span = (end or info["duration"]) - start
+            fps = args.sample_fps or auto_sample_fps(span)
+            frames, sheets = extract_keyframes(video, info, fps, span, start, end, segments, args, notes, out)
 
     started = recording_start(video, info)
     if segments is not None:
@@ -1027,7 +1078,9 @@ def main() -> None:
 
     # stdout is for the calling agent: a short, parseable summary
     print(f"CONTEXT={ctx}")
-    print(f"FRAMES_DIR={out / 'frames'}")
+    print(f"MEDIA={'audio' if info['audio_only'] else 'video'}")
+    if not info["audio_only"]:
+        print(f"FRAMES_DIR={out / 'frames'}")
     print(f"FRAME_COUNT={len(frames)}")
     if sheets:
         print(f"SHEETS={' '.join(str(out / x) for x in sheets)}")
